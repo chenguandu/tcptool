@@ -63,6 +63,31 @@ impl Encoding {
     }
 }
 
+/// A custom quick command
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct QuickCommand {
+    pub id: String,
+    pub name: String,
+    /// JT808 message ID (0 for raw hex)
+    pub msg_id: u16,
+    /// Raw hex data to send
+    pub raw_hex: String,
+}
+
+impl QuickCommand {
+    pub fn new(name: &str, raw_hex: &str) -> Self {
+        Self {
+            id: format!("cmd-{:x}", std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()),
+            name: name.to_string(),
+            msg_id: 0,
+            raw_hex: raw_hex.to_string(),
+        }
+    }
+}
+
 /// Main application state
 pub struct TcpToolApp {
     /// List of connection configs (the source of truth for the list UI)
@@ -81,6 +106,8 @@ pub struct TcpToolApp {
     pub encoding: Encoding,
     /// New connection dialog state
     pub show_new_conn_dialog: bool,
+    /// Index of connection being edited (None = new connection)
+    pub editing_conn_idx: Option<usize>,
     /// Editing connection config
     pub edit_conn: ConnectionConfig,
     /// Receiver for connection events
@@ -103,6 +130,12 @@ pub struct TcpToolApp {
     initialized: bool,
     /// Export dialog visibility
     show_export_dialog: bool,
+    /// Custom quick commands
+    pub custom_commands: Vec<QuickCommand>,
+    /// Quick command dialog
+    show_cmd_dialog: bool,
+    edit_cmd_index: Option<usize>,
+    edit_cmd: QuickCommand,
 }
 
 impl Default for TcpToolApp {
@@ -117,6 +150,7 @@ impl Default for TcpToolApp {
             selected_msg: HashMap::new(),
             encoding: Encoding::HEX,
             show_new_conn_dialog: false,
+            editing_conn_idx: None,
             edit_conn: ConnectionConfig::default(),
             event_rx,
             event_tx,
@@ -128,6 +162,10 @@ impl Default for TcpToolApp {
             db: None,
             initialized: false,
             show_export_dialog: false,
+            custom_commands: Vec::new(),
+            show_cmd_dialog: false,
+            edit_cmd_index: None,
+            edit_cmd: QuickCommand::new("", ""),
         }
     }
 }
@@ -492,8 +530,6 @@ impl eframe::App for TcpToolApp {
         // ── Top toolbar ──
         TopBottomPanel::top("toolbar").show(ctx, |ui| {
             egui::menu::bar(ui, |ui| {
-                ui.heading("🔧 TCP 调试工具 - JT808");
-                ui.separator();
                 if ui.button("➕ 新建连接").clicked() {
                     self.edit_conn = ConnectionConfig::default();
                     self.show_new_conn_dialog = true;
@@ -583,9 +619,25 @@ impl eframe::App for TcpToolApp {
                                 if response.clicked() {
                                     self.selected_conn = Some(i);
                                 }
-                                if response.secondary_clicked() {
-                                    to_delete = Some(i);
+                                if response.double_clicked() {
+                                    // Double-click to auto-connect
+                                    if let Some(h) = self.handles.get(&conn.id) {
+                                        h.connect();
+                                    }
                                 }
+                                // Right-click context menu
+                                response.context_menu(|ui| {
+                                    if ui.button("📝编辑").clicked() {
+                                        self.edit_conn = self.connections[i].clone();
+                                        self.editing_conn_idx = Some(i);
+                                        self.show_new_conn_dialog = true;
+                                        ui.close_menu();
+                                    }
+                                    if ui.button("✕删除").clicked() {
+                                        to_delete = Some(i);
+                                        ui.close_menu();
+                                    }
+                                });
                             });
                         }
                         if let Some(idx) = to_delete {
@@ -593,6 +645,10 @@ impl eframe::App for TcpToolApp {
                             // Disconnect and remove handle
                             if let Some(h) = self.handles.remove(&conn_id) {
                                 h.disconnect();
+                            }
+                            // Delete from database
+                            if let Some(ref db) = self.db {
+                                let _ = db.delete_connection(&conn_id);
                             }
                             self.conn_states.remove(&conn_id);
                             self.messages.remove(&conn_id);
@@ -652,21 +708,77 @@ impl eframe::App for TcpToolApp {
                     ui.add_space(8.0);
                     ui.heading("⚡ 快捷指令");
                     ui.separator();
+
                     if self.current_conn_state() == Some(ConnState::Connected) {
-                        ui.label("点击发送 JT808 指令:");
+                        // Built-in commands
+                        egui::CollapsingHeader::new("内置指令")
+                            .default_open(true)
+                            .show(ui, |ui| {
+                                if ui.button("💓 心跳 (0x0002)").clicked() {
+                                    self.send_heartbeat();
+                                }
+                                if ui.button("📝 注册 (0x0100)").clicked() {
+                                    self.run_registration_flow();
+                                }
+                                if ui.button("🔑 鉴权 (0x0102)").clicked() {
+                                    self.send_auth();
+                                }
+                                if ui.button("📍 位置汇报 (0x0200)").clicked() {
+                                    self.send_location_report();
+                                }
+                            });
+
                         ui.add_space(4.0);
 
-                        if ui.button("💓 心跳 (0x0002)").clicked() {
-                            self.send_heartbeat();
-                        }
-                        if ui.button("📝 注册 (0x0100)").clicked() {
-                            self.run_registration_flow();
-                        }
-                        if ui.button("🔑 鉴权 (0x0102)").clicked() {
-                            self.send_auth();
-                        }
-                        if ui.button("📍 位置汇报 (0x0200)").clicked() {
-                            self.send_location_report();
+                        // Custom commands
+                        egui::CollapsingHeader::new(format!("自定义指令 ({})", self.custom_commands.len()))
+                            .default_open(true)
+                            .show(ui, |ui| {
+                                let mut to_delete: Option<usize> = None;
+                                let cmds: Vec<(String, String)> = self.custom_commands.iter()
+                                    .map(|c| (c.name.clone(), c.raw_hex.clone()))
+                                    .collect();
+                                for (i, (cmd_name, cmd_hex)) in cmds.iter().enumerate() {
+                                    let btn = ui.button(cmd_name);
+                                    if btn.clicked() {
+                                        // Join multi-line hex, then parse
+                                        let hex = cmd_hex
+                                            .replace('\n', " ")
+                                            .replace('\r', " ")
+                                            .replace(' ', "")
+                                            .replace(',', "");
+                                        if let Ok(data) = (0..hex.len())
+                                            .step_by(2)
+                                            .filter(|&i| i + 1 <= hex.len())
+                                            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16))
+                                            .collect::<Result<Vec<u8>, _>>()
+                                        {
+                                            self.send_raw(data);
+                                        }
+                                    }
+                                    btn.context_menu(|ui| {
+                                        if ui.button("编辑").clicked() {
+                                            let idx = i; // Copy the index
+                                            self.edit_cmd = self.custom_commands[idx].clone();
+                                            self.edit_cmd_index = Some(idx);
+                                            self.show_cmd_dialog = true;
+                                            ui.close_menu();
+                                        }
+                                        if ui.button("删除").clicked() {
+                                            to_delete = Some(i);
+                                            ui.close_menu();
+                                        }
+                                    });
+                                }
+                                if let Some(idx) = to_delete {
+                                    self.custom_commands.remove(idx);
+                                }
+                            });
+
+                        if ui.button("➕ 添加指令").clicked() {
+                            self.edit_cmd = QuickCommand::new("新指令", "");
+                            self.edit_cmd_index = None;
+                            self.show_cmd_dialog = true;
                         }
 
                         ui.add_space(4.0);
@@ -718,6 +830,9 @@ impl eframe::App for TcpToolApp {
                             if connected && !self.send_text.is_empty() {
                                 self.send_from_input();
                             }
+                        }
+                        if ui.button("清空").clicked() {
+                            self.send_text.clear();
                         }
                     });
                     let resp = ui.add(
@@ -798,9 +913,10 @@ impl eframe::App for TcpToolApp {
             });
         });
 
-        // ── New connection dialog ──
+        // ── Connection dialog (new/edit) ──
         if self.show_new_conn_dialog {
-            egui::Window::new("新建连接")
+            let is_new = self.editing_conn_idx.is_none();
+            egui::Window::new(if is_new { "新建连接" } else { "编辑连接" })
                 .collapsible(false)
                 .resizable(false)
                 .show(ctx, |ui| {
@@ -846,15 +962,27 @@ impl eframe::App for TcpToolApp {
                             if let Some(ref db) = self.db {
                                 let _ = db.save_connection(&config);
                             }
-                            // Create connection handle
-                            let handle = connection::start_connection(config.clone(), self.event_tx.clone());
-                            self.conn_states.insert(conn_id.clone(), ConnState::Disconnected);
-                            self.handles.insert(conn_id, handle);
-                            self.connections.push(config);
-                            self.selected_conn = Some(self.connections.len() - 1);
+                            if is_new {
+                                // Create new connection
+                                let handle = connection::start_connection(config.clone(), self.event_tx.clone());
+                                self.conn_states.insert(conn_id.clone(), ConnState::Disconnected);
+                                self.handles.insert(conn_id, handle);
+                                self.connections.push(config);
+                                self.selected_conn = Some(self.connections.len() - 1);
+                            } else {
+                                // Update existing connection
+                                if let Some(idx) = self.editing_conn_idx {
+                                    if idx < self.connections.len() {
+                                        self.connections[idx] = config;
+                                        self.selected_conn = Some(idx);
+                                    }
+                                }
+                            }
+                            self.editing_conn_idx = None;
                             self.show_new_conn_dialog = false;
                         }
                         if ui.button("❌ 取消").clicked() {
+                            self.editing_conn_idx = None;
                             self.show_new_conn_dialog = false;
                         }
                     });
@@ -905,6 +1033,53 @@ impl eframe::App for TcpToolApp {
                     });
                 });
         }
+
+        // ── Quick command dialog ──
+        if self.show_cmd_dialog {
+            let is_new = self.edit_cmd_index.is_none();
+            egui::Window::new(if is_new { "添加快捷指令" } else { "编辑快捷指令" })
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    egui::Grid::new("cmd_grid")
+                        .num_columns(2)
+                        .spacing([8.0, 4.0])
+                        .show(ui, |ui| {
+                            ui.label("名称:");
+                            ui.text_edit_singleline(&mut self.edit_cmd.name);
+                            ui.end_row();
+
+                            ui.label("HEX 数据 (多行):");
+                            ui.add(
+                                egui::TextEdit::multiline(&mut self.edit_cmd.raw_hex)
+                                    .desired_rows(5)
+                                    .desired_width(280.0)
+                                    .font(egui::TextStyle::Monospace)
+                                    .hint_text("每行一段 HEX，如:\n7E00020000...\n7E01000000..."),
+                            );
+                            ui.end_row();
+                        });
+
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("✅ 确定").clicked() {
+                            if !self.edit_cmd.name.is_empty() && !self.edit_cmd.raw_hex.is_empty() {
+                                if let Some(idx) = self.edit_cmd_index {
+                                    if idx < self.custom_commands.len() {
+                                        self.custom_commands[idx] = self.edit_cmd.clone();
+                                    }
+                                } else {
+                                    self.custom_commands.push(self.edit_cmd.clone());
+                                }
+                            }
+                            self.show_cmd_dialog = false;
+                        }
+                        if ui.button("❌ 取消").clicked() {
+                            self.show_cmd_dialog = false;
+                        }
+                    });
+                });
+        }
     }
 }
 
@@ -942,7 +1117,6 @@ impl TcpToolApp {
         };
 
         self.send_raw(data);
-        self.send_text.clear();
     }
 
     /// Export messages as JSON string

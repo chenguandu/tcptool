@@ -123,9 +123,9 @@ pub fn start_connection(
     let rx_buffer = Arc::new(Mutex::new(Vec::new()));
     let conn_id = config.id.clone();
 
-    let config_clone = config.clone();
     let state_clone = state.clone();
     let rx_buf_clone = rx_buffer.clone();
+    let config_clone = config.clone();
 
     tokio::spawn(async move {
         let mut stream: Option<TcpStream> = None;
@@ -134,7 +134,10 @@ pub fn start_connection(
         ));
 
         loop {
+            // Use biased select so we check for commands first, then read, then heartbeat
             tokio::select! {
+                biased;
+
                 Some(cmd) = cmd_rx.recv() => {
                     match cmd {
                         ConnCommand::Connect => {
@@ -174,43 +177,47 @@ pub fn start_connection(
                         }
                     }
                 }
-                _ = heartbeat_interval.tick(), if stream.is_some() => {
-                    // Heartbeat check - this is just a placeholder;
-                    // actual heartbeat sending is done via JT808 protocol layer
-                }
-            }
 
-            // Try to read data on connected stream
-            if let Some(ref mut s) = stream {
-                let mut buf = vec![0u8; 4096];
-                match s.try_read(&mut buf) {
-                    Ok(0) => {
-                        // Connection closed
-                        stream = None;
-                        *state_clone.lock().await = ConnState::Disconnected;
-                        let _ = event_tx.send((conn_id.clone(), ConnEvent::Disconnected("连接关闭".into())));
+                // Wait for socket to become readable (data available)
+                _readable = async {
+                    if let Some(ref mut s) = stream {
+                        s.readable().await.ok()
+                    } else {
+                        None::<()>
                     }
-                    Ok(n) => {
-                        let data = buf[..n].to_vec();
-                        rx_buf_clone.lock().await.extend_from_slice(&data);
-                        let _ = event_tx.send((conn_id.clone(), ConnEvent::DataReceived(data)));
-                    }
-                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        // No data available, that's fine
-                    }
-                    Err(e) => {
-                        // Read error - might be connection closed
-                        if e.kind() != std::io::ErrorKind::NotConnected
-                            && e.kind() != std::io::ErrorKind::ConnectionReset
-                            && e.kind() != std::io::ErrorKind::ConnectionAborted
-                        {
-                            log::warn!("Read error: {}", e);
+                }, if stream.is_some() => {
+                    // Drain all available data
+                    if let Some(ref mut s) = stream {
+                        loop {
+                            let mut buf = vec![0u8; 4096];
+                            match s.try_read(&mut buf) {
+                                Ok(0) => {
+                                    stream = None;
+                                    *state_clone.lock().await = ConnState::Disconnected;
+                                    let _ = event_tx.send((conn_id.clone(), ConnEvent::Disconnected("连接关闭".into())));
+                                    break;
+                                }
+                                Ok(n) => {
+                                    buf.truncate(n);
+                                    rx_buf_clone.lock().await.extend_from_slice(&buf);
+                                    let _ = event_tx.send((conn_id.clone(), ConnEvent::DataReceived(buf)));
+                                }
+                                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                    break;
+                                }
+                                Err(_) => {
+                                    stream = None;
+                                    *state_clone.lock().await = ConnState::Disconnected;
+                                    break;
+                                }
+                            }
                         }
                     }
                 }
-            } else {
-                // Small delay when not connected to avoid busy loop
-                time::sleep(Duration::from_millis(50)).await;
+
+                _ = heartbeat_interval.tick(), if stream.is_some() => {
+                    // Just wake up, no action needed (heartbeat is sent from UI layer)
+                }
             }
         }
     });
