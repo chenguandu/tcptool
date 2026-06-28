@@ -518,6 +518,17 @@ impl eframe::App for TcpToolApp {
                     }
                     self.connections = db.load_connections().unwrap_or_default();
                 }
+                // Load custom quick commands from DB
+                if let Ok(cmds) = db.load_quick_commands() {
+                    for (id, name, msg_id, raw_hex, _sort) in cmds {
+                        self.custom_commands.push(QuickCommand {
+                            id,
+                            name,
+                            msg_id,
+                            raw_hex,
+                        });
+                    }
+                }
                 self.db = Some(db);
             }
         }
@@ -772,6 +783,7 @@ impl eframe::App for TcpToolApp {
                                 }
                                 if let Some(idx) = to_delete {
                                     self.custom_commands.remove(idx);
+                                    self.save_custom_commands_to_db();
                                 }
                             });
 
@@ -895,6 +907,7 @@ impl eframe::App for TcpToolApp {
                     }).collect();
 
                     egui::ScrollArea::vertical()
+                        .stick_to_bottom(true)
                         .auto_shrink([false; 2])
                         .show(ui, |ui| {
                             for (i, (ts, arrow, summary)) in msgs.iter().enumerate() {
@@ -1071,6 +1084,8 @@ impl eframe::App for TcpToolApp {
                                 } else {
                                     self.custom_commands.push(self.edit_cmd.clone());
                                 }
+                                // Save all custom commands to DB
+                                self.save_custom_commands_to_db();
                             }
                             self.show_cmd_dialog = false;
                         }
@@ -1170,5 +1185,14 @@ impl TcpToolApp {
             ));
         }
         csv
+    }
+
+    /// Save all custom commands to SQLite
+    fn save_custom_commands_to_db(&self) {
+        if let Some(ref db) = self.db {
+            for (i, cmd) in self.custom_commands.iter().enumerate() {
+                let _ = db.save_quick_command(&cmd.id, &cmd.name, cmd.msg_id, &cmd.raw_hex, i as i32);
+            }
+        }
     }
 }
