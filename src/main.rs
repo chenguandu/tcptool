@@ -1,3 +1,4 @@
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 use eframe::egui;
 use tcptool::TcpToolApp;
 
@@ -12,7 +13,8 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 800.0])
             .with_min_inner_size([900.0, 600.0])
-            .with_title("TCP 调试工具 - JT808"),
+            .with_title("TCP 调试工具 - JT808")
+            .with_icon(load_embedded_icon()),
         ..Default::default()
     };
     eframe::run_native(
@@ -94,4 +96,25 @@ fn setup_fonts(ctx: &egui::Context) {
 
 fn load_font_data(path: &str) -> Option<Vec<u8>> {
     std::fs::read(path).ok()
+}
+
+/// Load icon from embedded bytes (always available, no external file needed)
+fn load_embedded_icon() -> egui::IconData {
+    // logo.png is embedded at compile time via include_bytes!
+    let png_bytes = include_bytes!("../logo.png");
+    match image::load_from_memory(png_bytes) {
+        Ok(img) => {
+            let img = img.into_rgba8();
+            let (w, h) = img.dimensions();
+            egui::IconData {
+                rgba: img.into_raw(),
+                width: w,
+                height: h,
+            }
+        }
+        Err(e) => {
+            log::warn!("Failed to decode embedded icon: {}", e);
+            egui::IconData::default()
+        }
+    }
 }

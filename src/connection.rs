@@ -216,7 +216,26 @@ pub fn start_connection(
                 }
 
                 _ = heartbeat_interval.tick(), if stream.is_some() => {
-                    // Just wake up, no action needed (heartbeat is sent from UI layer)
+                    // Send heartbeat automatically from connection task
+                    let hb = crate::protocol::builder::build_heartbeat(&config_clone.terminal_phone, 1);
+                    if let Some(ref mut s) = stream {
+                        let _ = s.write_all(&hb).await;
+                        let _ = s.flush().await;
+                    }
+                }
+            }
+
+            // Auto-reconnect if enabled
+            if stream.is_none() && config_clone.auto_reconnect {
+                time::sleep(Duration::from_secs(3)).await;
+                *state_clone.lock().await = ConnState::Connecting;
+                let addr = format!("{}:{}", config_clone.host, config_clone.port);
+                if let Ok(s) = TcpStream::connect(&addr).await {
+                    stream = Some(s);
+                    *state_clone.lock().await = ConnState::Connected;
+                    let _ = event_tx.send((conn_id.clone(), ConnEvent::Connected));
+                } else {
+                    *state_clone.lock().await = ConnState::Disconnected;
                 }
             }
         }
