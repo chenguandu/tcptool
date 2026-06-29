@@ -13,7 +13,7 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 800.0])
             .with_min_inner_size([900.0, 600.0])
-            .with_title("TCP 调试工具 - JT808")
+            .with_title(format!("TCP 调试工具 v{} - JT808", env!("CARGO_PKG_VERSION")))
             .with_icon(load_embedded_icon()),
         ..Default::default()
     };

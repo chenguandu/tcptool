@@ -136,6 +136,8 @@ pub struct TcpToolApp {
     show_cmd_dialog: bool,
     edit_cmd_index: Option<usize>,
     edit_cmd: QuickCommand,
+    /// Toast notification timestamp
+    toast_time: Option<std::time::Instant>,
 }
 
 impl Default for TcpToolApp {
@@ -166,6 +168,7 @@ impl Default for TcpToolApp {
             show_cmd_dialog: false,
             edit_cmd_index: None,
             edit_cmd: QuickCommand::new("", ""),
+            toast_time: None,
         }
     }
 }
@@ -301,13 +304,12 @@ impl TcpToolApp {
 
     /// Send a JT808 auth message on the selected connection
     fn send_auth(&mut self) {
-        let info = {
-            let conn_id = self.current_conn_id();
-            conn_id.as_ref().and_then(|id| {
-                self.connections.iter().find(|c| c.id == *id)
-                    .map(|c| (c.terminal_phone.clone(), c.auth_code.clone(), id.clone()))
+        // Clone the data we need first to avoid borrow conflicts
+        let info = self.selected_conn.and_then(|idx| {
+            self.connections.get(idx).map(|c| {
+                (c.terminal_phone.clone(), c.auth_code.clone(), c.id.clone())
             })
-        };
+        });
         if let Some((phone, auth_code, conn_id)) = info {
             if auth_code.is_empty() {
                 self.add_message(&conn_id, Direction::Send, Vec::new(),
@@ -322,13 +324,9 @@ impl TcpToolApp {
 
     /// Send a JT808 location report on the selected connection
     fn send_location_report(&mut self) {
-        let info = {
-            let conn_id = self.current_conn_id();
-            conn_id.as_ref().and_then(|id| {
-                self.connections.iter().find(|c| c.id == *id)
-                    .map(|c| (c.terminal_phone.clone(), id.clone()))
-            })
-        };
+        let info = self.selected_conn.and_then(|idx| {
+            self.connections.get(idx).map(|c| (c.terminal_phone.clone(), c.id.clone()))
+        });
         if let Some((phone, conn_id)) = info {
             let serial = self.next_serial(&conn_id);
             let frame = builder::build_location_report(
@@ -537,6 +535,8 @@ impl eframe::App for TcpToolApp {
         self.process_events();
         // Check and send heartbeats
         self.check_heartbeats();
+        // Check if toast should still be shown
+        let show_toast = self.toast_time.map_or(false, |t| t.elapsed().as_secs_f64() < 2.0);
 
         // ── Top toolbar ──
         TopBottomPanel::top("toolbar").show(ctx, |ui| {
@@ -683,27 +683,46 @@ impl eframe::App for TcpToolApp {
             .min_width(200.0)
             .show(ctx, |ui| {
                 ui.vertical(|ui| {
-                    ui.heading("📄 报文详情");
-                    ui.separator();
-                    ui.add_space(4.0);
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false; 2])
+                        .show(ui, |ui| {
+                            ui.heading("📄 报文详情");
+                            ui.separator();
+                            ui.add_space(4.0);
 
-                    if let Some(msg) = self.current_selected_msg() {
-                        ui.label(format!("时间: {}", msg.timestamp.format("%H:%M:%S")));
-                        ui.label(format!("方向: {} {}", msg.direction.arrow(), msg.direction.name()));
-                        ui.label(format!("编码: {}", msg.encoding));
-                        ui.separator();
-                        ui.label("原始 HEX:");
-                        let mut hex_display = msg.raw_hex.clone();
-                        ui.add(
-                            egui::TextEdit::multiline(&mut hex_display)
-                                .desired_rows(6)
-                                .font(egui::TextStyle::Monospace)
-                                .interactive(false),
-                        );
-                        ui.separator();
+                            if let Some(msg) = self.current_selected_msg() {
+                                let raw_hex = msg.raw_hex.clone();
+                                let ts = msg.timestamp.format("%H:%M:%S").to_string();
+                                let dir_arrow = msg.direction.arrow().to_string();
+                                let dir_name = msg.direction.name().to_string();
+                                let encoding = msg.encoding.clone();
+                                let parsed = msg.parsed.clone();
+                                ui.label(format!("时间: {}", ts));
+                                ui.label(format!("方向: {} {}", dir_arrow, dir_name));
+                                ui.label(format!("编码: {}", encoding));
+                                ui.separator();
+                                ui.horizontal(|ui| {
+                                    ui.label("原始 HEX:");
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        if ui.button("复制").clicked() {
+                                            ui.ctx().copy_text(raw_hex.clone());
+                                            self.toast_time = Some(std::time::Instant::now());
+                                        }
+                                    });
+                                });
+                                egui::Frame::group(ui.style())
+                                    .inner_margin(egui::Margin::symmetric(4, 2))
+                                    .show(ui, |ui| {
+                                        ui.add(
+                                            egui::Label::new(&raw_hex)
+                                                .sense(egui::Sense::click())
+                                                .selectable(true),
+                                        );
+                                    });
+                                ui.separator();
 
                         // Parsed message details
-                        if let Some(ref parsed) = msg.parsed {
+                        if let Some(ref parsed) = parsed {
                             egui::CollapsingHeader::new(format!("📊 解析: {}", parsed.name()))
                                 .default_open(true)
                                 .show(ui, |ui| {
@@ -731,8 +750,17 @@ impl eframe::App for TcpToolApp {
                                 if ui.button("📝 注册 (0x0100)").clicked() {
                                     self.run_registration_flow();
                                 }
-                                if ui.button("🔑 鉴权 (0x0102)").clicked() {
+                                let has_auth = self.selected_conn
+                                    .and_then(|idx| self.connections.get(idx))
+                                    .map(|c| !c.auth_code.is_empty())
+                                    .unwrap_or(false);
+                                let auth_btn = egui::Button::new("🔑 鉴权 (0x0102)")
+                                    .min_size(egui::vec2(ui.available_width(), 0.0));
+                                let auth_resp = ui.add_enabled(has_auth, auth_btn);
+                                if auth_resp.clicked() {
                                     self.send_auth();
+                                } else if !has_auth {
+                                    auth_resp.clone().on_disabled_hover_text("鉴权码为空，请先执行注册流程或填写鉴权码");
                                 }
                                 if ui.button("📍 位置汇报 (0x0200)").clicked() {
                                     self.send_location_report();
@@ -821,6 +849,7 @@ impl eframe::App for TcpToolApp {
                     } else {
                         ui.label("(请先连接服务器)");
                     }
+                        });
                 });
             });
 
@@ -925,6 +954,22 @@ impl eframe::App for TcpToolApp {
                 }
             });
         });
+
+        // ── Toast notification ──
+        if show_toast {
+            egui::Area::new(egui::Id::new("toast_area"))
+                .anchor(egui::Align2::CENTER_TOP, [0.0, 40.0])
+                .order(egui::Order::Foreground)
+                .show(ctx, |ui| {
+                    egui::Frame::NONE
+                        .fill(egui::Color32::from_black_alpha(200))
+                        .corner_radius(6.0)
+                        .inner_margin(egui::Margin::symmetric(12, 6))
+                        .show(ui, |ui| {
+                            ui.colored_label(egui::Color32::WHITE, "✅ 已复制到剪贴板");
+                        });
+                });
+        }
 
         // ── Connection dialog (new/edit) ──
         if self.show_new_conn_dialog {

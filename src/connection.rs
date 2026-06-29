@@ -129,6 +129,7 @@ pub fn start_connection(
 
     tokio::spawn(async move {
         let mut stream: Option<TcpStream> = None;
+        let mut intentional_disconnect = false;
         let mut heartbeat_interval = time::interval(Duration::from_secs(
             config_clone.heartbeat_interval_secs.max(1) as u64,
         ));
@@ -141,6 +142,7 @@ pub fn start_connection(
                 Some(cmd) = cmd_rx.recv() => {
                     match cmd {
                         ConnCommand::Connect => {
+                            intentional_disconnect = false;
                             *state_clone.lock().await = ConnState::Connecting;
                             let addr = format!("{}:{}", config_clone.host, config_clone.port);
                             match TcpStream::connect(&addr).await {
@@ -156,6 +158,7 @@ pub fn start_connection(
                             }
                         }
                         ConnCommand::Disconnect => {
+                            intentional_disconnect = true;
                             if let Some(mut s) = stream.take() {
                                 *state_clone.lock().await = ConnState::Disconnecting;
                                 let _ = s.shutdown().await;
@@ -225,8 +228,8 @@ pub fn start_connection(
                 }
             }
 
-            // Auto-reconnect if enabled
-            if stream.is_none() && config_clone.auto_reconnect {
+            // Auto-reconnect if enabled (skip if user manually disconnected)
+            if stream.is_none() && config_clone.auto_reconnect && !intentional_disconnect {
                 time::sleep(Duration::from_secs(3)).await;
                 *state_clone.lock().await = ConnState::Connecting;
                 let addr = format!("{}:{}", config_clone.host, config_clone.port);
