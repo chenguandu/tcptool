@@ -9,6 +9,9 @@ CREATE TABLE IF NOT EXISTS connections (
     heartbeat_interval INTEGER NOT NULL DEFAULT 30,
     terminal_phone TEXT NOT NULL DEFAULT '013900000001',
     auth_code TEXT NOT NULL DEFAULT '',
+    protocol_version TEXT NOT NULL DEFAULT '2013',
+    imei TEXT NOT NULL DEFAULT '',
+    software_version TEXT NOT NULL DEFAULT 'V1.0.0',
     created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
 );

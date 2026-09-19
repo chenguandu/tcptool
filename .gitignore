@@ -1,2 +1,4 @@
 /target
 .reasonix
+tcptool.db-shm
+tcptool.db-wal

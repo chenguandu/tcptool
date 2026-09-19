@@ -7,6 +7,7 @@ use rusqlite::{params, Connection, Result as SqlResult};
 
 use crate::app::{Direction, MessageEntry};
 use crate::connection::ConnectionConfig;
+use crate::protocol::types::ProtocolVersion;
 
 /// Database manager
 pub struct Database {
@@ -26,6 +27,38 @@ impl Database {
     /// Create tables if they don't exist
     fn initialize(&self) -> SqlResult<()> {
         self.conn.execute_batch(schema::SCHEMA_SQL)?;
+        self.migrate()?;
+        Ok(())
+    }
+
+    /// Apply incremental migrations for databases created by older versions
+    fn migrate(&self) -> SqlResult<()> {
+        let mut columns: Vec<String> = Vec::new();
+        {
+            let mut stmt = self.conn.prepare("PRAGMA table_info(connections)")?;
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                columns.push(row.get(1)?);
+            }
+        }
+        if !columns.iter().any(|c| c == "protocol_version") {
+            self.conn.execute(
+                "ALTER TABLE connections ADD COLUMN protocol_version TEXT NOT NULL DEFAULT '2013'",
+                [],
+            )?;
+        }
+        if !columns.iter().any(|c| c == "imei") {
+            self.conn.execute(
+                "ALTER TABLE connections ADD COLUMN imei TEXT NOT NULL DEFAULT ''",
+                [],
+            )?;
+        }
+        if !columns.iter().any(|c| c == "software_version") {
+            self.conn.execute(
+                "ALTER TABLE connections ADD COLUMN software_version TEXT NOT NULL DEFAULT 'V1.0.0'",
+                [],
+            )?;
+        }
         Ok(())
     }
 
@@ -37,8 +70,8 @@ impl Database {
 
     pub fn save_connection(&self, config: &ConnectionConfig) -> SqlResult<()> {
         self.conn.execute(
-            "INSERT OR REPLACE INTO connections (id, name, host, port, auto_reconnect, heartbeat_interval, terminal_phone, auth_code)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT OR REPLACE INTO connections (id, name, host, port, auto_reconnect, heartbeat_interval, terminal_phone, auth_code, protocol_version, imei, software_version)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 config.id,
                 config.name,
@@ -48,6 +81,9 @@ impl Database {
                 config.heartbeat_interval_secs,
                 config.terminal_phone,
                 config.auth_code,
+                config.protocol_version.short_name(),
+                config.imei,
+                config.software_version,
             ],
         )?;
         Ok(())
@@ -55,10 +91,11 @@ impl Database {
 
     pub fn load_connections(&self) -> SqlResult<Vec<ConnectionConfig>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, name, host, port, auto_reconnect, heartbeat_interval, terminal_phone, auth_code
+            "SELECT id, name, host, port, auto_reconnect, heartbeat_interval, terminal_phone, auth_code, protocol_version, imei, software_version
              FROM connections ORDER BY created_at"
         )?;
         let rows = stmt.query_map([], |row| {
+            let version: String = row.get(8)?;
             Ok(ConnectionConfig {
                 id: row.get(0)?,
                 name: row.get(1)?,
@@ -68,6 +105,9 @@ impl Database {
                 heartbeat_interval_secs: row.get(5)?,
                 terminal_phone: row.get(6)?,
                 auth_code: row.get(7)?,
+                protocol_version: ProtocolVersion::from_str_loose(&version),
+                imei: row.get(9)?,
+                software_version: row.get(10)?,
             })
         })?;
         rows.collect()
@@ -207,5 +247,72 @@ mod tests {
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].id, config.id);
         assert_eq!(loaded[0].name, config.name);
+        assert_eq!(loaded[0].protocol_version, ProtocolVersion::V2013);
+    }
+
+    #[test]
+    fn test_save_load_connection_2019() {
+        let db = Database::open(":memory:").unwrap();
+        let mut config = ConnectionConfig::default();
+        config.protocol_version = ProtocolVersion::V2019;
+        db.save_connection(&config).unwrap();
+        let loaded = db.load_connections().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].protocol_version, ProtocolVersion::V2019);
+    }
+
+    #[test]
+    fn test_save_load_connection_generic_tcp() {
+        let db = Database::open(":memory:").unwrap();
+        let mut config = ConnectionConfig::default();
+        config.protocol_version = ProtocolVersion::GenericTcp;
+        db.save_connection(&config).unwrap();
+        let loaded = db.load_connections().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].protocol_version, ProtocolVersion::GenericTcp);
+    }
+
+    #[test]
+    fn test_migration_adds_protocol_version() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("tcptool-migrate-{}.db", unique));
+        let path_str = path.to_string_lossy().to_string();
+        let _ = std::fs::remove_file(&path);
+
+        // Create a database with the old (pre-2019) connections table
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE connections (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    host TEXT NOT NULL DEFAULT '127.0.0.1',
+                    port INTEGER NOT NULL DEFAULT 8080,
+                    auto_reconnect INTEGER NOT NULL DEFAULT 0,
+                    heartbeat_interval INTEGER NOT NULL DEFAULT 30,
+                    terminal_phone TEXT NOT NULL DEFAULT '013900000001',
+                    auth_code TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+                );
+                INSERT INTO connections (id, name, host, port, auto_reconnect, heartbeat_interval, terminal_phone, auth_code)
+                VALUES ('legacy-1', '旧连接', '127.0.0.1', 5100, 0, 30, '013900000001', '');",
+            )
+            .unwrap();
+        }
+
+        let db = Database::open(&path_str).unwrap();
+        let loaded = db.load_connections().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].id, "legacy-1");
+        assert_eq!(loaded[0].protocol_version, ProtocolVersion::V2013);
+        assert_eq!(loaded[0].imei, "");
+        assert_eq!(loaded[0].software_version, "V1.0.0");
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
     }
 }

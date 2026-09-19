@@ -9,6 +9,8 @@ use tokio::time::{self, Duration};
 
 use serde::{Deserialize, Serialize};
 
+use crate::protocol::types::ProtocolVersion;
+
 /// Connection configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConnectionConfig {
@@ -18,8 +20,22 @@ pub struct ConnectionConfig {
     pub port: u16,
     pub auto_reconnect: bool,
     pub heartbeat_interval_secs: u32,
+    /// 终端 SN（承载在终端手机号字段）：2013 版 12 个十六进制字符，2019 版 20 个
     pub terminal_phone: String,
     pub auth_code: String,
+    /// JT/T 808 protocol version used by this connection
+    #[serde(default)]
+    pub protocol_version: ProtocolVersion,
+    /// 2019 鉴权用：终端 IMEI（15 字节）
+    #[serde(default)]
+    pub imei: String,
+    /// 2019 鉴权用：软件版本号（20 字节）
+    #[serde(default = "default_software_version")]
+    pub software_version: String,
+}
+
+fn default_software_version() -> String {
+    "V1.0.0".into()
 }
 
 impl Default for ConnectionConfig {
@@ -33,6 +49,9 @@ impl Default for ConnectionConfig {
             heartbeat_interval_secs: 30,
             terminal_phone: "013900000001".into(),
             auth_code: "".into(),
+            protocol_version: ProtocolVersion::V2013,
+            imei: "".into(),
+            software_version: default_software_version(),
         }
     }
 }
@@ -89,6 +108,8 @@ pub enum ConnCommand {
     Connect,
     Disconnect,
     Send(Vec<u8>),
+    /// Update the protocol version used for auto-heartbeat on the running task
+    SetProtocolVersion(ProtocolVersion),
 }
 
 /// A handle to a managed TCP connection
@@ -110,6 +131,9 @@ impl TcpConnectionHandle {
     pub fn send(&self, data: Vec<u8>) {
         let _ = self.command_tx.send(ConnCommand::Send(data));
     }
+    pub fn set_protocol_version(&self, version: ProtocolVersion) {
+        let _ = self.command_tx.send(ConnCommand::SetProtocolVersion(version));
+    }
 }
 
 /// Start a managed TCP connection in a background tokio task.
@@ -125,7 +149,7 @@ pub fn start_connection(
 
     let state_clone = state.clone();
     let rx_buf_clone = rx_buffer.clone();
-    let config_clone = config.clone();
+    let mut config_clone = config.clone();
 
     tokio::spawn(async move {
         let mut stream: Option<TcpStream> = None;
@@ -178,6 +202,9 @@ pub fn start_connection(
                                 }
                             }
                         }
+                        ConnCommand::SetProtocolVersion(version) => {
+                            config_clone.protocol_version = version;
+                        }
                     }
                 }
 
@@ -218,9 +245,13 @@ pub fn start_connection(
                     }
                 }
 
-                _ = heartbeat_interval.tick(), if stream.is_some() => {
+                _ = heartbeat_interval.tick(), if stream.is_some() && config_clone.protocol_version.is_jt808() => {
                     // Send heartbeat automatically from connection task
-                    let hb = crate::protocol::builder::build_heartbeat(&config_clone.terminal_phone, 1);
+                    let hb = crate::protocol::builder::build_heartbeat(
+                        config_clone.protocol_version,
+                        &config_clone.terminal_phone,
+                        1,
+                    );
                     if let Some(ref mut s) = stream {
                         let _ = s.write_all(&hb).await;
                         let _ = s.flush().await;
